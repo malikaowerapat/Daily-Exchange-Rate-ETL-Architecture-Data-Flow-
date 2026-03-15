@@ -1,4 +1,4 @@
-# 🏦 Daily Exchange Rate ETL Dataflow from API to Sharepoint
+# 🏦 Daily Exchange Rate ETL Dataflow from API(Bank of Thailand) to Sharepoint
 
 💰This project is a Python script designed to extract daily exchange rate data, unzip compressed files, read the CSV files inside, and transform data from multiple formats into a single standardized structure. It prioritizes data sources based on a defined hierarchy, then generates an Exchange Rate Master table with four columns: date, from_currency, to_currency, and rate. The final output is saved as a CSV file, and each execution is logged separately in a text file. Overall, this code functions as a small ETL system for daily exchange rates, with the goal of producing a clean, ready-to-use output file that can be integrated into other systems such as data imports, ERP, BI, automation, or downstream integrations.
 
