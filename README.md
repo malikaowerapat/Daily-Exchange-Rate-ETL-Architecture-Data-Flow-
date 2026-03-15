@@ -1,7 +1,32 @@
 # 🏦 Daily Exchange Rate ETL Dataflow from API(Bank of Thailand) to Sharepoint
 
 💰This project is a Python script designed to extract daily exchange rate data, unzip compressed files, read the CSV files inside, and transform data from multiple formats into a single standardized structure. It prioritizes data sources based on a defined hierarchy, then generates an Exchange Rate Master table with four columns: date, from_currency, to_currency, and rate. The final output is saved as a CSV file, and each execution is logged separately in a text file. Overall, this code functions as a small ETL system for daily exchange rates, with the goal of producing a clean, ready-to-use output file that can be integrated into other systems such as data imports, ERP, BI, automation, or downstream integrations.
+Automated pipeline to extract daily exchange rates from the Bank of Thailand, transform the data, generate curated output files, and upload the latest files to SharePoint.
 
+## Architecture Overview
+
+```mermaid
+flowchart LR
+    A["Task Scheduler<br/>02:00 AM"] --> B["Python ETL Job<br/>Daily_exchange_rate_F&O.py"]
+
+    B --> C["Download Source ZIP<br/>ER_CSV_EN.zip"]
+    C --> D["Extract ZIP to Staging"]
+    D --> E["Transform and Standardize Data"]
+    E --> F["Generate Output Files<br/>- DailyExchangeMaster.csv<br/>- log_daily_exchange.txt"]
+
+    F --> G["Task Scheduler<br/>02:15 AM"]
+    G --> H["PowerShell Upload Job<br/>run_pushsharepoint.ps1"]
+    H --> I["SharePoint Folder<br/>Overwrite latest files"]
+
+    style A fill:#EAF3FF,stroke:#3B82F6,stroke-width:1.5px
+    style B fill:#E8FFF3,stroke:#10B981,stroke-width:1.5px
+    style C fill:#FFFBEA,stroke:#F59E0B,stroke-width:1.5px
+    style D fill:#FFFBEA,stroke:#F59E0B,stroke-width:1.5px
+    style E fill:#FFFBEA,stroke:#F59E0B,stroke-width:1.5px
+    style F fill:#F3F4F6,stroke:#6B7280,stroke-width:1.5px
+    style G fill:#EAF3FF,stroke:#3B82F6,stroke-width:1.5px
+    style H fill:#F5EFFF,stroke:#8B5CF6,stroke-width:1.5px
+    style I fill:#ECFDF5,stroke:#22C55E,stroke-width:1.5px
 
 
 โปรเจกต์นี้เป็นสคริปต์ Python สำหรับ ดึงข้อมูลอัตราแลกเปลี่ยนรายวัน, แตกไฟล์ ZIP, อ่านไฟล์ CSV ภายใน, แปลงข้อมูลจากหลายรูปแบบให้เป็นมาตรฐานเดียวกัน, เลือกแหล่งข้อมูลตามลำดับความสำคัญ, จากนั้นสร้าง ตาราง Exchange Rate Master แบบ 4 คอลัมน์ (date, from_currency, to_currency, rate) และบันทึกผลลัพธ์ลง CSV พร้อมเขียน log การรันทุกครั้งไว้ในไฟล์ข้อความแยกต่างหาก โค้ดนี้ทำระบบ ETL ขนาดเล็กสำหรับ Exchange Rate รายวัน โดยเน้นให้ได้ไฟล์ผลลัพธ์ที่พร้อมใช้งานต่อในระบบอื่น เช่น Data import, ERP, BI, automation หรือ integration ต่อไป
