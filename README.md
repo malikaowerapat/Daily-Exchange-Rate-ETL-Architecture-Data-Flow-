@@ -4,9 +4,9 @@
 Automated pipeline to extract daily exchange rates from the Bank of Thailand, transform the data, generate curated output files, and upload the latest files to SharePoint.
 
 ## Architecture Overview
-┌──────────────┐ → ┌────────────┐ → ┌──────────┐ → ┌─────────┐ → ┌─────────┐ → ┌────────────┐
-│ Scheduler    │   │ Python ETL │   │ BOT API  │   │ Staging │   │ Curated │   │ SharePoint │
-└──────────────┘   └────────────┘   └──────────┘   └─────────┘   └─────────┘   └────────────┘
+[Scheduler Loop] → [Python ETL] → [BOT API] → [Staging] → [Curated] → [SharePoint]
+                      ↑______________________________________________|
+                           Daily pipeline cycle
 
 
 
