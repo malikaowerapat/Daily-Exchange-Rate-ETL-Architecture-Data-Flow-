@@ -1,4 +1,4 @@
-#Daily Exchange Rate ETL Dataflow from API to Sharepoint
+# Daily Exchange Rate ETL Dataflow from API to Sharepoint
 
 โปรเจกต์นี้เป็นสคริปต์ Python สำหรับ ดึงข้อมูลอัตราแลกเปลี่ยนรายวัน, แตกไฟล์ ZIP, อ่านไฟล์ CSV ภายใน, แปลงข้อมูลจากหลายรูปแบบให้เป็นมาตรฐานเดียวกัน, เลือกแหล่งข้อมูลตามลำดับความสำคัญ, จากนั้นสร้าง ตาราง Exchange Rate Master แบบ 4 คอลัมน์ (date, from_currency, to_currency, rate) และบันทึกผลลัพธ์ลง CSV พร้อมเขียน log การรันทุกครั้งไว้ในไฟล์ข้อความแยกต่างหาก โค้ดนี้ทำระบบ ETL ขนาดเล็กสำหรับ Exchange Rate รายวัน โดยเน้นให้ได้ไฟล์ผลลัพธ์ที่พร้อมใช้งานต่อในระบบอื่น เช่น Data import, ERP, BI, automation หรือ integration ต่อไป
 ## 1) ดาวน์โหลดไฟล์ ZIP ของอัตราแลกเปลี่ยน
