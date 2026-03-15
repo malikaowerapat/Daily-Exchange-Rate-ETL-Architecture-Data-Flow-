@@ -1,0 +1,691 @@
+import io
+import os
+import re
+import zipfile
+import warnings
+import time
+from datetime import datetime, date
+from typing import Dict, List, Optional, Tuple
+
+import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
+
+
+# =============================
+# CONFIG: currencies that must match "original" BOT scale when to_currency == THB
+# (ใช้ buy_raw/sell_raw แทน thb_per_1_xxx เฉพาะกลุ่มนี้)
+# =============================
+ORIGINAL_SCALE_CCYS = {"IDR", "JPY", "KHR", "LAK", "VND"}  # base codes only
+
+# =============================
+# CONFIG: ONLY these currencies should use "-S" for sell label
+# (ตัวอื่นๆ ยังคงรูปแบบเดิม: XXS เช่น USD->USS)
+# =============================
+SELL_DASH_ONLY = {"KES", "ILS"}
+
+# =============================
+# OUTPUT FILE NAMES (2 files only)
+# =============================
+MASTER_CSV_NAME = "DailyExchangeMaster.csv"
+LOG_TXT_NAME = "log_daily_exchange.txt"
+
+
+# =============================
+# Timezone (Asia/Bangkok)
+# =============================
+def now_th() -> datetime:
+    try:
+        from zoneinfo import ZoneInfo  # py>=3.9
+        return datetime.now(ZoneInfo("Asia/Bangkok"))
+    except Exception:
+        return datetime.now()
+
+
+# =============================
+# HTTP + Retry (compatible old/new urllib3)
+# =============================
+def _make_retry(total=6, backoff=0.6):
+    try:
+        from urllib3.util.retry import Retry
+    except Exception:
+        return None
+
+    try:
+        return Retry(
+            total=total,
+            connect=total,
+            read=total,
+            status=total,
+            backoff_factor=backoff,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(["GET", "HEAD"]),
+            raise_on_status=False,
+            respect_retry_after_header=True,
+        )
+    except TypeError:
+        return Retry(
+            total=total,
+            connect=total,
+            read=total,
+            status=total,
+            backoff_factor=backoff,
+            status_forcelist=(429, 500, 502, 503, 504),
+            method_whitelist=frozenset(["GET", "HEAD"]),
+            raise_on_status=False,
+        )
+
+
+def build_session(retries: int = 6, backoff: float = 0.6) -> requests.Session:
+    s = requests.Session()
+    retry = _make_retry(total=retries, backoff=backoff)
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10) if retry else HTTPAdapter()
+
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) thaifxrates-final/6.9",
+            "Accept": "*/*",
+            "Connection": "keep-alive",
+        }
+    )
+    s.trust_env = True
+    return s
+
+
+def _download_once(
+    s: requests.Session,
+    url: str,
+    out_path: str,
+    timeout: Tuple[int, int],
+    verify: bool,
+) -> None:
+    with s.get(url, stream=True, timeout=timeout, verify=verify) as r:
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 128):
+                if chunk:
+                    f.write(chunk)
+
+
+def download_with_ssl_fallback(
+    urls: List[str],
+    out_path: str,
+    timeout: Tuple[int, int] = (20, 180),
+) -> str:
+    s = build_session()
+    last_err = None
+
+    # 1) verify=True
+    for url in urls:
+        try:
+            _download_once(s, url, out_path, timeout, verify=True)
+            return url
+        except Exception as e:
+            last_err = e
+
+    # 2) verify=False (last resort)
+    warnings.filterwarnings("ignore", message="Unverified HTTPS request")
+    for url in urls:
+        if url.lower().startswith("https://"):
+            try:
+                print("[WARN] SSL verify failed. Retrying with verify=False (last resort).")
+                _download_once(s, url, out_path, timeout, verify=False)
+                return url + " (verify=False)"
+            except Exception as e:
+                last_err = e
+
+    raise RuntimeError(f"Download failed for all URLs. Last error: {type(last_err).__name__}: {last_err}")
+
+
+# =============================
+# File save helpers
+# =============================
+def save_csv_overwrite(df: pd.DataFrame, out_path: str) -> None:
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    df.to_csv(out_path, index=False, encoding="utf-8-sig")
+
+
+def read_text_if_exists(path: str) -> str:
+    if not os.path.exists(path):
+        return ""
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def write_text_overwrite(text: str, out_path: str) -> None:
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+# =============================
+# Parse helpers
+# =============================
+def read_text_bytes(b: bytes) -> str:
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin1"):
+        try:
+            return b.decode(enc)
+        except Exception:
+            pass
+    return b.decode("utf-8", errors="replace")
+
+
+def extract_date_from_filename(name: str) -> Optional[date]:
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", name)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def find_header(lines: List[str]) -> Optional[Tuple[int, str]]:
+    for i, ln in enumerate(lines):
+        low = ln.strip().lower()
+        if "country" in low and "currency" in low:
+            if "|" in ln:
+                return i, "|"
+            if "," in ln:
+                return i, ","
+    return None
+
+
+def parse_unit_from_country(country: str) -> int:
+    if not isinstance(country, str):
+        return 1
+    m = re.search(r"\(([\d,]+)\s*\)", country)
+    if not m:
+        return 1
+    try:
+        return int(m.group(1).replace(",", ""))
+    except Exception:
+        return 1
+
+
+def to_float_series(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        s.astype(str)
+        .str.replace(",", "", regex=False)
+        .replace({"nan": None, "None": None, "": None}),
+        errors="coerce",
+    )
+
+
+# =============================
+# ZIP -> Extract -> List
+# =============================
+def extract_zip(zip_path: str, extract_dir: str) -> None:
+    os.makedirs(extract_dir, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(extract_dir)
+
+
+def list_csv_files(extract_dir: str) -> List[str]:
+    return sorted([fn for fn in os.listdir(extract_dir) if fn.lower().endswith(".csv")])
+
+
+def parse_csv_file(path: str) -> pd.DataFrame:
+    with open(path, "rb") as f:
+        text = read_text_bytes(f.read())
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    hdr = find_header(lines)
+    if hdr is None:
+        return pd.DataFrame()
+
+    start_idx, delim = hdr
+    table_text = "\n".join(lines[start_idx:])
+
+    if delim == "|":
+        df = pd.read_csv(io.StringIO(table_text), sep="|", engine="python")
+    else:
+        df = pd.read_csv(io.StringIO(table_text))
+
+    df.columns = [str(c).strip() for c in df.columns]
+    df = df.dropna(axis=1, how="all")
+    return df
+
+
+def choose_target_date(files: List[str], prefer_today: date) -> Tuple[date, List[str], List[date]]:
+    by_date: Dict[date, List[str]] = {}
+    for fn in files:
+        d = extract_date_from_filename(fn)
+        if d is None:
+            continue
+        by_date.setdefault(d, []).append(fn)
+
+    dates = sorted(by_date.keys())
+    if not dates:
+        raise RuntimeError("No dated CSV files found in ZIP.")
+
+    if prefer_today in by_date:
+        return prefer_today, sorted(by_date[prefer_today]), dates
+
+    latest = dates[-1]
+    return latest, sorted(by_date[latest]), dates
+
+
+# =============================
+# Normalize CSV1 / CSV2
+# =============================
+def normalize_csv1_counter_rates(df: pd.DataFrame, file_name: str, buy_mode: str = "transfer") -> pd.DataFrame:
+    df2 = df.copy()
+    df2.columns = [str(c).strip() for c in df2.columns]
+    cols_low = {c.lower(): c for c in df2.columns}
+
+    def pick_contains(parts: List[str]) -> Optional[str]:
+        for low, orig in cols_low.items():
+            if all(p in low for p in parts):
+                return orig
+        return None
+
+    c_country = pick_contains(["country"])
+    c_ccy = pick_contains(["currency"])
+    c_sight = pick_contains(["sight"])
+    c_transfer = pick_contains(["transfer"])
+    c_sell = pick_contains(["selling"])
+
+    if not (c_country and c_ccy and c_sell and (c_sight or c_transfer)):
+        return pd.DataFrame()
+
+    fx_date = extract_date_from_filename(file_name)
+    buy_col = c_transfer if buy_mode.lower() == "transfer" and c_transfer else c_sight
+
+    out = pd.DataFrame(
+        {
+            "date": fx_date,
+            "country": df2[c_country].astype(str).str.strip(),
+            "currency": df2[c_ccy].astype(str).str.strip().str.upper(),
+            "buy_raw": df2[buy_col],
+            "sell_raw": df2[c_sell],
+            "source_table": "csv1_avg_counter_rates",
+            "source_file": file_name,
+        }
+    )
+
+    out["unit"] = out["country"].apply(parse_unit_from_country)
+    out["buy_raw"] = to_float_series(out["buy_raw"])
+    out["sell_raw"] = to_float_series(out["sell_raw"])
+
+    out = out[out["currency"].notna() & (out["currency"] != "")]
+    out = out.dropna(subset=["buy_raw", "sell_raw"], how="all")
+
+    out["thb_per_1_buy"] = out["buy_raw"] / out["unit"]
+    out["thb_per_1_sell"] = out["sell_raw"] / out["unit"]
+
+    out = out.dropna(subset=["thb_per_1_buy", "thb_per_1_sell"], how="any").reset_index(drop=True)
+
+    return out[
+        ["date", "country", "currency", "unit", "buy_raw", "sell_raw", "thb_per_1_buy", "thb_per_1_sell", "source_table", "source_file"]
+    ]
+
+
+def normalize_csv2_lseg_rates(df: pd.DataFrame, file_name: str) -> pd.DataFrame:
+    df2 = df.copy()
+    df2.columns = [str(c).strip() for c in df2.columns]
+    cols_low = {c.lower(): c for c in df2.columns}
+
+    def pick_any(needles: List[str]) -> Optional[str]:
+        for low, orig in cols_low.items():
+            if any(n in low for n in needles):
+                return orig
+        return None
+
+    c_country = pick_any(["country"])
+    c_ccy = pick_any(["currency"])
+    c_buy = pick_any(["buying rates", "buying rate", "buying"])
+    c_sell = pick_any(["selling rates", "selling rate", "selling"])
+
+    if not (c_country and c_ccy and c_buy and c_sell):
+        return pd.DataFrame()
+
+    fx_date = extract_date_from_filename(file_name)
+
+    out = pd.DataFrame(
+        {
+            "date": fx_date,
+            "country": df2[c_country].astype(str).str.strip(),
+            "currency": df2[c_ccy].astype(str).str.strip().str.upper(),
+            "buy_raw": df2[c_buy],
+            "sell_raw": df2[c_sell],
+            "source_table": "csv2_lseg_bkk_crossing",
+            "source_file": file_name,
+        }
+    )
+
+    out["unit"] = out["country"].apply(parse_unit_from_country)
+    out["buy_raw"] = to_float_series(out["buy_raw"])
+    out["sell_raw"] = to_float_series(out["sell_raw"])
+
+    out = out[out["currency"].notna() & (out["currency"] != "")]
+    out = out.dropna(subset=["buy_raw", "sell_raw"], how="all")
+
+    out["thb_per_1_buy"] = out["buy_raw"] / out["unit"]
+    out["thb_per_1_sell"] = out["sell_raw"] / out["unit"]
+
+    out = out.dropna(subset=["thb_per_1_buy", "thb_per_1_sell"], how="any").reset_index(drop=True)
+
+    return out[
+        ["date", "country", "currency", "unit", "buy_raw", "sell_raw", "thb_per_1_buy", "thb_per_1_sell", "source_table", "source_file"]
+    ]
+
+
+def combine_with_priority(df_all: pd.DataFrame) -> pd.DataFrame:
+    priority_rank = {"csv1_avg_counter_rates": 1, "csv2_lseg_bkk_crossing": 2}
+    df = df_all.copy()
+    df["priority"] = df["source_table"].map(priority_rank).fillna(999).astype(int)
+    df = df.sort_values(["date", "currency", "priority"]).drop_duplicates(["date", "currency"], keep="first")
+    return df.drop(columns=["priority"]).reset_index(drop=True)
+
+
+# =============================
+# Sell label logic:
+# - Default: OLD style XXS (USD->USS)
+# - ONLY KES/ILS: "-S"
+# =============================
+def to_sell_code_old(ccy: str) -> str:
+    c = (ccy or "").strip().upper()
+    if len(c) < 3:
+        return c
+    return c[:2] + "S"
+
+
+def sell_label(ccy: str) -> str:
+    c = (ccy or "").strip().upper()
+    if c in SELL_DASH_ONLY:
+        return f"{c}-S"
+    return to_sell_code_old(c)
+
+
+# =============================
+# Build FINAL in 4 columns: date, from_currency, to_currency, rate
+# =============================
+def build_final_rate_4cols(
+    df_base: pd.DataFrame,
+    base_ccy: str = "THB",
+    date_format: str = "%d/%m/%Y",
+) -> Tuple[pd.DataFrame, int, float]:
+    required = {"date", "currency", "buy_raw", "sell_raw", "thb_per_1_buy", "thb_per_1_sell"}
+    missing = required - set(df_base.columns)
+    if missing:
+        raise ValueError(f"Missing columns for final output: {missing}")
+
+    out_rows = []
+
+    for d, g in df_base.groupby("date"):
+        buy_map: Dict[str, float] = {base_ccy: 1.0}
+        sell_map: Dict[str, float] = {base_ccy: 1.0}
+        buy_raw_map: Dict[str, float] = {base_ccy: 1.0}
+        sell_raw_map: Dict[str, float] = {base_ccy: 1.0}
+
+        for _, r in g.iterrows():
+            ccy = str(r["currency"]).strip().upper()
+            if not ccy or ccy == "NAN":
+                continue
+
+            if pd.notna(r["buy_raw"]):
+                buy_raw_map[ccy] = float(r["buy_raw"])
+            if pd.notna(r["sell_raw"]):
+                sell_raw_map[ccy] = float(r["sell_raw"])
+
+            if pd.notna(r["thb_per_1_buy"]):
+                buy_map[ccy] = float(r["thb_per_1_buy"])
+            if pd.notna(r["thb_per_1_sell"]):
+                sell_map[ccy] = float(r["thb_per_1_sell"])
+
+        ccy_list = sorted([c for c in buy_map.keys() if c != base_ccy])
+
+        # (1) BUY: CCY -> THB
+        for ccy in ccy_list:
+            rate = buy_raw_map.get(ccy, buy_map[ccy]) if ccy in ORIGINAL_SCALE_CCYS else buy_map[ccy]
+            out_rows.append({"date": d, "from_currency": ccy, "to_currency": base_ccy, "rate": rate})
+
+        # (2) SELL: sell_label(CCY) -> THB
+        for ccy in ccy_list:
+            rate = sell_raw_map.get(ccy, sell_map[ccy]) if ccy in ORIGINAL_SCALE_CCYS else sell_map[ccy]
+            out_rows.append({"date": d, "from_currency": sell_label(ccy), "to_currency": base_ccy, "rate": rate})
+
+        # (3) BUY cross: frm -> to
+        for frm in ccy_list:
+            for to in ccy_list:
+                if frm == to:
+                    continue
+                out_rows.append({"date": d, "from_currency": frm, "to_currency": to, "rate": buy_map[frm] / buy_map[to]})
+
+        # (4) SELL cross: sell_label(frm) -> sell_label(to)
+        for frm in ccy_list:
+            for to in ccy_list:
+                if frm == to:
+                    continue
+                out_rows.append(
+                    {"date": d, "from_currency": sell_label(frm), "to_currency": sell_label(to), "rate": sell_map[frm] / sell_map[to]}
+                )
+
+    df_final = pd.DataFrame(out_rows)
+    df_final["date"] = pd.to_datetime(df_final["date"]).dt.strftime(date_format)
+
+    # count distinct currencies in base (exclude THB if exists)
+    currency_count = int(df_base["currency"].dropna().astype(str).str.upper().nunique())
+    if "THB" in set(df_base["currency"].dropna().astype(str).str.upper()):
+        currency_count -= 1
+    currency_count = max(currency_count, 0)
+
+    # USD->THB (buy) from final
+    usd_to_thb_buy = 0.0
+    try:
+        row = df_final[(df_final["from_currency"] == "USD") & (df_final["to_currency"] == "THB")].head(1)
+        if not row.empty:
+            usd_to_thb_buy = float(row["rate"].iloc[0])
+    except Exception:
+        usd_to_thb_buy = 0.0
+
+    return df_final[["date", "from_currency", "to_currency", "rate"]], currency_count, usd_to_thb_buy
+
+
+# =============================
+# Output directory selection (LOCAL PATH)
+# =============================
+def choose_output_dir() -> str:
+    env_dir = os.environ.get("ONEDRIVE_OUTPUT_DIR")
+    if env_dir:
+        os.makedirs(env_dir, exist_ok=True)
+        return env_dir
+
+    for key in ("OneDrive", "OneDriveConsumer"):
+        p = os.environ.get(key)
+        if p and os.path.isdir(p):
+            out_dir = os.path.join(p, "Documents", "Daily exchange rate BOT")
+            os.makedirs(out_dir, exist_ok=True)
+            return out_dir
+
+    out_dir = os.path.join(os.getcwd(), "output")
+    os.makedirs(out_dir, exist_ok=True)
+    return out_dir
+
+
+# =============================
+# LOG formatting (your requested format)
+# - Header = latest run
+# - HISTORY = keep previous and append new row (most recent at bottom)
+# =============================
+def _history_table_header() -> str:
+    return (
+        "HISTORY (most recent at bottom)\n"
+        "-------------------------------------------------\n"
+        "| RATE_DATE  | RUN_DATETIME         | CCY | USD_TO_THB | STATUS  | DUR_MIN | ERRORS |\n"
+        "|------------|----------------------|-----|------------|---------|---------|--------|\n"
+    )
+
+
+def _format_history_row(rate_date: str, run_dt: str, ccy: int, usd: float, status: str, dur_min: float, errors_short: str) -> str:
+    # keep errors short for table readability
+    esc = (errors_short or "-").replace("\n", " ").strip()
+    if len(esc) > 40:
+        esc = esc[:37] + "..."
+    return f"| {rate_date} | {run_dt} | {ccy:<3d} | {usd:10.4f} | {status:<7} | {dur_min:7.2f} | {esc} |\n"
+
+
+def build_log_text_with_history(
+    existing_log_text: str,
+    rate_date: date,
+    run_dt: datetime,
+    currency_count: int,
+    usd_to_thb: float,
+    status: str,
+    duration_min: float,
+    errors_full: str,
+) -> str:
+    rate_date_str = rate_date.isoformat()
+    run_dt_str = run_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Normalize errors message to match your example
+    if status == "SUCCESS" and (not errors_full or errors_full.strip() == "-"):
+        errors_full = "No error (everything is fine)"
+
+    header = (
+        f"Daily Exchange Rate Run Log [RATE_DATE={rate_date_str}]\n"
+        f"=================================================\n"
+        f"RATE_DATE={rate_date_str}\n"
+        f"RUN_DATETIME={run_dt_str}\n"
+        f"CURRENCY_COUNT={currency_count}\n"
+        f"USD_TO_THB={usd_to_thb:.4f}\n"
+        f"STATUS={status}\n"
+        f"DURATION_MIN={duration_min:.2f}\n"
+        f"ERRORS={errors_full}\n\n"
+    )
+
+    # Extract existing history section if exists; otherwise start new
+    history_start = existing_log_text.find("HISTORY (most recent at bottom)")
+    if history_start >= 0:
+        history_block = existing_log_text[history_start:]
+        # Ensure it has the table header lines; if not, rebuild
+        if "| RATE_DATE" not in history_block:
+            history_block = _history_table_header()
+    else:
+        history_block = _history_table_header()
+
+    # Append a new history row at bottom
+    errors_short = "No error" if status == "SUCCESS" else (errors_full or "-")
+    history_block += _format_history_row(
+        rate_date=rate_date_str,
+        run_dt=run_dt_str,
+        ccy=currency_count,
+        usd=usd_to_thb,
+        status=status,
+        dur_min=duration_min,
+        errors_short=errors_short,
+    )
+
+    return header + history_block
+
+
+# =============================
+# MAIN (2 files only)
+# =============================
+def main():
+    start = time.perf_counter()
+    run_dt = now_th()
+    today_th = run_dt.date()
+
+    out_dir = choose_output_dir()
+    csv_path = os.path.join(out_dir, MASTER_CSV_NAME)
+    log_path = os.path.join(out_dir, LOG_TXT_NAME)
+
+    status = "FAIL"
+    errors_full = "-"
+    currency_count = 0
+    usd_to_thb = 0.0
+    rate_date_used = today_th
+
+    try:
+        zip_urls = [
+            "https://www.thaifxrates.net/ER_CSV_EN.zip",
+            "http://www.thaifxrates.net/ER_CSV_EN.zip",
+        ]
+        zip_path = "ER_CSV_EN.zip"
+
+        used_url = download_with_ssl_fallback(zip_urls, zip_path)
+        print(f"[INFO] Downloaded: {used_url} -> {zip_path}")
+
+        extract_dir = "thaifxrates_extract"
+        extract_zip(zip_path, extract_dir)
+
+        files = list_csv_files(extract_dir)
+        if not files:
+            raise RuntimeError("No CSV files extracted from ZIP.")
+
+        rate_date_used, target_files, all_dates = choose_target_date(files, prefer_today=today_th)
+
+        if rate_date_used != today_th:
+            print(
+                f"[WARN] No FX files for today ({today_th.isoformat()}) in ZIP. "
+                f"Fallback to latest available date = {rate_date_used.isoformat()}"
+            )
+            print(f"[INFO] Dates available (last 10): {[d.isoformat() for d in all_dates[-10:]]}")
+        else:
+            print(f"[INFO] Using today's files: {rate_date_used.isoformat()}")
+
+        base_frames = []
+        for fn in target_files:
+            full = os.path.join(extract_dir, fn)
+            df_raw = parse_csv_file(full)
+            if df_raw.empty:
+                continue
+
+            n1 = normalize_csv1_counter_rates(df_raw, fn, buy_mode="transfer")
+            if not n1.empty:
+                base_frames.append(n1)
+
+            n2 = normalize_csv2_lseg_rates(df_raw, fn)
+            if not n2.empty:
+                base_frames.append(n2)
+
+        if not base_frames:
+            raise RuntimeError(f"No recognizable FX tables found for date {rate_date_used.isoformat()}.")
+
+        df_all_sources = pd.concat(base_frames, ignore_index=True)
+        df_base = combine_with_priority(df_all_sources)
+        df_base = df_base[df_base["date"] == rate_date_used].copy()
+
+        df_final, currency_count, usd_to_thb = build_final_rate_4cols(df_base, base_ccy="THB", date_format="%d/%m/%Y")
+
+        # ✅ Save master CSV (overwrite always)
+        save_csv_overwrite(df_final, csv_path)
+
+        status = "SUCCESS"
+        errors_full = "No error (everything is fine)"
+
+    except Exception as e:
+        status = "FAIL"
+        errors_full = f"{type(e).__name__}: {e}"
+
+    finally:
+        duration_min = (time.perf_counter() - start) / 60.0
+        if status != "SUCCESS":
+            currency_count = 0
+            usd_to_thb = 0.0
+
+        existing = read_text_if_exists(log_path)
+        new_log = build_log_text_with_history(
+            existing_log_text=existing,
+            rate_date=rate_date_used,
+            run_dt=run_dt,
+            currency_count=currency_count,
+            usd_to_thb=usd_to_thb,
+            status=status,
+            duration_min=duration_min,
+            errors_full=errors_full,
+        )
+        # ✅ Save ONE log file (overwrite header + keep history by re-writing full content)
+        write_text_overwrite(new_log, log_path)
+
+        print(f"[SAVED] {csv_path}")
+        print(f"[SAVED] {log_path}")
+        print(f"[INFO] STATUS={status} | RATE_DATE={rate_date_used.isoformat()} | RUN_DATETIME={run_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+
+
+if __name__ == "__main__":
+    main()
